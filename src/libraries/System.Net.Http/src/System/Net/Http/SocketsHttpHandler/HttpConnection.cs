@@ -519,10 +519,23 @@ namespace System.Net.Http
 
                 if (HttpTelemetry.Log.IsEnabled()) HttpTelemetry.Log.RequestHeadersStop();
 
+                // We should not have any buffered data here; if there was, it should have been treated as an error
+                // by the previous request handling.  (Note we do not support HTTP pipelining.)
+                Debug.Assert(_readOffset == _readLength);
+
+                // When the connection was taken out of the pool, a pre-emptive read was performed
+                // into the read buffer. We need to consume that read prior to issuing another read.
+                ValueTask<int>? t = ConsumeReadAheadTask();
+
                 if (request.Content == null)
                 {
                     // We have nothing more to send, so flush out any headers we haven't yet sent.
                     await FlushAsync(async).ConfigureAwait(false);
+
+                    if (t != null)
+                    {
+                        await ReadAhead(t.GetValueOrDefault(), async, false).ConfigureAwait(false);
+                    }
                 }
                 else
                 {
@@ -534,6 +547,12 @@ namespace System.Net.Http
                     // to run concurrently until we receive the final status line, at which point we wait for it.
                     if (!hasExpectContinueHeader)
                     {
+                        if (t != null)
+                        {
+                            await ReadAhead(t.GetValueOrDefault(), async, true).ConfigureAwait(false);
+                            CheckZeroRead();
+                        }
+
                         await SendRequestContentAsync(request, CreateRequestContentStream(request), async, cancellationToken).ConfigureAwait(false);
                     }
                     else
@@ -542,6 +561,12 @@ namespace System.Net.Http
                         // all of them, and we need to do so before initiating the send, as once we do that, it effectively
                         // owns the right to write, and we don't want to concurrently be accessing the write buffer.
                         await FlushAsync(async).ConfigureAwait(false);
+
+                        if (t != null)
+                        {
+                            await ReadAhead(t.GetValueOrDefault(), async, false).ConfigureAwait(false);
+                            CheckZeroRead();
+                        }
 
                         // Create a TCS we'll use to block the request content from being sent, and create a timer that's used
                         // as a fail-safe to unblock the request content if we don't hear back from the server in a timely manner.
@@ -558,60 +583,13 @@ namespace System.Net.Http
                 // Start to read response.
                 _allowedReadLineBytes = _pool.Settings.MaxResponseHeadersByteLength;
 
-                // We should not have any buffered data here; if there was, it should have been treated as an error
-                // by the previous request handling.  (Note we do not support HTTP pipelining.)
-                Debug.Assert(_readOffset == _readLength);
-
-                // When the connection was taken out of the pool, a pre-emptive read was performed
-                // into the read buffer. We need to consume that read prior to issuing another read.
-                ValueTask<int>? t = ConsumeReadAheadTask();
-                if (t != null)
-                {
-                    // Handle the pre-emptive read.  For the async==false case, hopefully the read has
-                    // already completed and this will be a nop, but if it hasn't, the caller will be forced to block
-                    // waiting for the async operation to complete.  We will only hit this case for proxied HTTPS
-                    // requests that use a pooled connection, as in that case we don't have a Socket we
-                    // can poll and are forced to issue an async read.
-                    ValueTask<int> vt = t.GetValueOrDefault();
-                    int bytesRead;
-                    if (vt.IsCompleted)
-                    {
-                        bytesRead = vt.Result;
-                    }
-                    else
-                    {
-                        if (!async)
-                        {
-                            Trace($"Pre-emptive read completed asynchronously for a synchronous request.");
-                        }
-
-                        bytesRead = await vt.ConfigureAwait(false);
-                    }
-
-                    if (NetEventSource.Log.IsEnabled()) Trace($"Received {bytesRead} bytes.");
-
-                    _readOffset = 0;
-                    _readLength = bytesRead;
-                }
-                else
+                if (t == null)
                 {
                     // No read-ahead, so issue a read ourselves. We will check below for EOF.
                     await InitialFillAsync(async).ConfigureAwait(false);
                 }
 
-                if (_readLength == 0)
-                {
-                    // The server shutdown the connection on their end, likely because of an idle timeout.
-                    // If we haven't started sending the request body yet (or there is no request body),
-                    // then we allow the request to be retried.
-                    if (!_startedSendingRequestBody)
-                    {
-                        _canRetry = true;
-                    }
-
-                    throw new IOException(SR.net_http_invalid_response_premature_eof);
-                }
-
+                CheckZeroRead();
 
                 // Parse the response status line.
                 var response = new HttpResponseMessage() { RequestMessage = request, Content = new HttpConnectionResponseContent() };
@@ -837,6 +815,55 @@ namespace System.Net.Http
                 }
                 // Otherwise, just allow the original exception to propagate.
                 throw;
+            }
+        }
+
+        private async ValueTask ReadAhead(ValueTask<int> task, bool async, bool flushIFneeded)
+        {
+            // Handle the pre-emptive read.  For the async==false case, hopefully the read has
+            // already completed and this will be a nop, but if it hasn't, the caller will be forced to block
+            // waiting for the async operation to complete.  We will only hit this case for proxied HTTPS
+            // requests that use a pooled connection, as in that case we don't have a Socket we
+            // can poll and are forced to issue an async read.
+            int bytesRead;
+            if (task.IsCompleted)
+            {
+                bytesRead = task.Result;
+            }
+            else
+            {
+                if (!async)
+                {
+                    Trace($"Pre-emptive read completed asynchronously for a synchronous request.");
+                }
+
+                if (flushIFneeded)
+                {
+                    await FlushAsync(async).ConfigureAwait(false);
+                }
+
+                bytesRead = await task.ConfigureAwait(false);
+            }
+
+            if (NetEventSource.Log.IsEnabled()) Trace($"Received {bytesRead} bytes.");
+
+            _readOffset = 0;
+            _readLength = bytesRead;
+        }
+
+        private void CheckZeroRead()
+        {
+            if (_readLength == 0)
+            {
+                // The server shutdown the connection on their end, likely because of an idle timeout.
+                // If we haven't started sending the request body yet (or there is no request body),
+                // then we allow the request to be retried.
+                if (!_startedSendingRequestBody)
+                {
+                    _canRetry = true;
+                }
+
+                throw new IOException(SR.net_http_invalid_response_premature_eof);
             }
         }
 
