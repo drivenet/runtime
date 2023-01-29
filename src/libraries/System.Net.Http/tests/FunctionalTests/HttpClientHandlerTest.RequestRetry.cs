@@ -150,7 +150,6 @@ namespace System.Net.Http.Functional.Tests
         [Fact]
         public async Task PostAsyncExpect100Continue_FailsAfterContentSendStarted_Throws()
         {
-            var contentSending = new TaskCompletionSource<bool>();
             var connectionClosed = new TaskCompletionSource<bool>();
 
             await LoopbackServer.CreateClientAndServerAsync(async url =>
@@ -162,13 +161,12 @@ namespace System.Net.Http.Functional.Tests
                     Assert.Equal(HttpStatusCode.OK, response1.StatusCode);
                     Assert.Equal(SimpleContent, await response1.Content.ReadAsStringAsync());
 
-                    // Send second request on same connection.  When the Expect: 100-continue timeout
-                    // expires, the content will start to be serialized and will signal the server to
-                    // close the connection; then once the connection is closed, the send will be allowed
-                    // to continue and will fail.
+                    // Send second request on same connection.  When content will start to be serialized,
+                    // it will signal the server to close the connection;
+                    // then once the connection is closed, the send will be allowed to continue and will fail.
                     var request = new HttpRequestMessage(HttpMethod.Post, url) { Version = UseVersion };
                     request.Headers.ExpectContinue = true;
-                    request.Content = new SynchronizedSendContent(contentSending, connectionClosed.Task);
+                    request.Content = new SynchronizedSendContent(connectionClosed.Task);
                     await Assert.ThrowsAsync<HttpRequestException>(() => client.SendAsync(TestAsync, request));
                 }
             },
@@ -183,10 +181,10 @@ namespace System.Net.Http.Functional.Tests
                     // Initial response
                     await connection.ReadRequestHeaderAndSendResponseAsync(content: SimpleContent);
 
-                    // Second response: Read request headers, then close connection
+                    // Second response: Read request headers, then wait for the Expect: 100-continue timeout to expire
                     List<string> lines = await connection.ReadRequestHeaderAsync();
                     Assert.Contains("Expect: 100-continue", lines);
-                    await contentSending.Task;
+                    await Task.Delay(TimeSpan.FromSeconds(1.5));
                 });
                 connectionClosed.SetResult(true);
             });
@@ -195,15 +193,13 @@ namespace System.Net.Http.Functional.Tests
         private sealed class SynchronizedSendContent : HttpContent
         {
             private readonly Task _connectionClosed;
-            private readonly TaskCompletionSource<bool> _sendingContent;
 
             // The content needs to be large enough to force Expect: 100-Continue behavior in SocketsHttpHandler.
             private readonly string _longContent = new String('a', 1025);
 
-            public SynchronizedSendContent(TaskCompletionSource<bool> sendingContent, Task connectionClosed)
+            public SynchronizedSendContent(Task connectionClosed)
             {
                 _connectionClosed = connectionClosed;
-                _sendingContent = sendingContent;
             }
 
 #if NETCOREAPP
@@ -213,7 +209,6 @@ namespace System.Net.Http.Functional.Tests
 
             protected override async Task SerializeToStreamAsync(Stream stream, TransportContext context)
             {
-                _sendingContent.SetResult(true);
                 await _connectionClosed;
                 await stream.WriteAsync(Encoding.UTF8.GetBytes(_longContent));
             }
